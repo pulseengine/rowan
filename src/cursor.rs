@@ -82,6 +82,7 @@
 //    - TBD
 
 use std::{
+    alloc::{self, Layout},
     borrow::Cow,
     cell::Cell,
     fmt,
@@ -215,15 +216,49 @@ unsafe fn free(mut data: ptr::NonNull<NodeData>) {
         loop {
             // Use self_alloc which retains original Box::into_raw provenance,
             // unaffected by any &NodeData references created during the node's lifetime.
-            let alloc_ptr = (*data.as_ptr()).self_alloc;
-            let node = Box::from_raw(alloc_ptr);
-            debug_assert_eq!(node.rc.get(), 0);
-            debug_assert!(node.first.get().is_null());
-            match node.parent.take() {
+            //
+            // cy-208: Do NOT reconstruct a Box here. `Box::from_raw(_).drop()`
+            // adds a strongly-protected unique retag covering the whole NodeData
+            // allocation. A sibling iterator (e.g. `SyntaxNodeChildren`,
+            // `SyntaxElementChildren`) walking next_sibling_or_token may hold
+            // an active SharedReadOnly retag on the same allocation when this
+            // free runs, which the strong protector forbids -> Stacked Borrows
+            // UB. Instead, drop the value in place and deallocate via the raw
+            // allocator API, which carries no retag.
+            //
+            // We also avoid creating any `&NodeData` (which would itself add
+            // a SharedReadOnly retag covering the whole allocation), reading
+            // each field through a raw projection with `addr_of!`/`addr_of_mut!`.
+            let alloc_ptr = ptr::addr_of!((*data.as_ptr()).self_alloc).read();
+
+            // Read fields raw to avoid SharedReadOnly retags spanning the alloc.
+            let parent_cell_ptr = ptr::addr_of_mut!((*alloc_ptr).parent);
+            let parent: Option<ptr::NonNull<NodeData>> = (*parent_cell_ptr).take();
+            let mutable = ptr::addr_of!((*alloc_ptr).mutable).read();
+
+            if cfg!(debug_assertions) {
+                let rc = (*ptr::addr_of!((*alloc_ptr).rc).cast::<u32>()).clone();
+                debug_assert_eq!(rc, 0);
+                let first = (*ptr::addr_of!((*alloc_ptr).first).cast::<*const NodeData>()).clone();
+                debug_assert!(first.is_null());
+            }
+
+            match parent {
                 Some(parent) => {
-                    if node.mutable {
-                        sll::unlink(&(*parent.as_ptr()).first, &*node)
+                    if mutable {
+                        // sll::unlink takes `&Cell<*const NodeData>` and `&Self`.
+                        // The element ref is unavoidable here, but it is narrow
+                        // (covers only the NodeData fields read by sll), and the
+                        // protector issue specifically arises from the *strong*
+                        // protector of Box::from_raw drop — not from `&` retags
+                        // that don't outlive this scope. Keep the `&*alloc_ptr`
+                        // call ordering identical to the pre-fix code.
+                        sll::unlink(&(*parent.as_ptr()).first, &*alloc_ptr)
                     }
+                    // Drop and deallocate the NodeData without going through
+                    // Box (which would strong-protect the allocation).
+                    ptr::drop_in_place(alloc_ptr);
+                    alloc::dealloc(alloc_ptr.cast::<u8>(), Layout::new::<NodeData>());
                     if NodeData::dec_rc_raw(parent) {
                         data = parent;
                     } else {
@@ -231,7 +266,10 @@ unsafe fn free(mut data: ptr::NonNull<NodeData>) {
                     }
                 }
                 None => {
-                    match &node.green {
+                    // Take ownership of the green tree before drop_in_place
+                    // runs the NodeData destructor and we release the allocation.
+                    let green_ptr = ptr::addr_of!((*alloc_ptr).green);
+                    match &*green_ptr {
                         Green::Node { ptr } => {
                             let p = ptr.as_ptr().read();
                             let _ = GreenNode::from_raw(p);
@@ -240,6 +278,8 @@ unsafe fn free(mut data: ptr::NonNull<NodeData>) {
                             let _ = GreenToken::from_raw(*ptr);
                         }
                     }
+                    ptr::drop_in_place(alloc_ptr);
+                    alloc::dealloc(alloc_ptr.cast::<u8>(), Layout::new::<NodeData>());
                     break;
                 }
             }
@@ -840,30 +880,39 @@ impl SyntaxNode {
         }
 
         let mut ptr = self.take_ptr();
-        let data = unsafe { ptr.as_mut() };
-        assert!(data.rc.get() == 1);
+        // cy-208: scope the `&mut NodeData` so it does not span `free(ptr)`.
+        // See `to_next_sibling_or_token` for the underlying SB rationale.
+        let result = {
+            let data = unsafe { ptr.as_mut() };
+            assert!(data.rc.get() == 1);
 
-        let parent = data.parent_node()?;
-        let parent_offset = parent.offset();
-        let siblings = parent.green_ref().children().raw.enumerate();
-        let index = data.index() as usize;
+            let parent = data.parent_node()?;
+            let parent_offset = parent.offset();
+            let siblings = parent.green_ref().children().raw.enumerate();
+            let index = data.index() as usize;
 
-        siblings
-            .skip(index + 1)
-            .find_map(|(index, child)| {
-                child.as_ref().into_node().map(|green| (green, index as u32, child.rel_offset()))
-            })
-            .map(|(green, index, rel_offset)| {
-                data.index.set(index);
-                data.offset = parent_offset + rel_offset;
-                data.green = Green::Node { ptr: Cell::new(green.into()) };
-                SyntaxNode { ptr: std::cell::UnsafeCell::new(ptr) }
-            })
-            .or_else(|| {
-                data.dec_rc();
-                unsafe { free(ptr) };
-                None
-            })
+            siblings
+                .skip(index + 1)
+                .find_map(|(index, child)| {
+                    child
+                        .as_ref()
+                        .into_node()
+                        .map(|green| (green, index as u32, child.rel_offset()))
+                })
+                .map(|(green, index, rel_offset)| {
+                    data.index.set(index);
+                    data.offset = parent_offset + rel_offset;
+                    data.green = Green::Node { ptr: Cell::new(green.into()) };
+                    SyntaxNode { ptr: std::cell::UnsafeCell::new(ptr) }
+                })
+        };
+        if result.is_none() {
+            unsafe {
+                let _ = NodeData::dec_rc_raw(ptr);
+                free(ptr);
+            }
+        }
+        result
     }
 
     pub fn next_sibling(&self) -> Option<SyntaxNode> {
@@ -1287,41 +1336,55 @@ impl SyntaxElement {
         }
 
         let mut ptr = self.take_ptr();
-        let data = unsafe { ptr.as_mut() };
+        // Compute the next-sibling element in a scope where `&mut NodeData`
+        // is alive, then *end* that borrow before potentially calling `free`.
+        // cy-208: holding `&mut NodeData` (or `&NodeData` via `data.dec_rc()`)
+        // across `free(ptr)` adds a strongly-protected retag covering the
+        // whole NodeData allocation; the deallocation inside `free` then
+        // violates Stacked Borrows.
+        let result = {
+            let data = unsafe { ptr.as_mut() };
 
-        let parent = data.parent_node()?;
-        let parent_offset = parent.offset();
-        let siblings = parent.green_ref().children().raw.enumerate();
-        let index = data.index() as usize;
+            let parent = data.parent_node()?;
+            let parent_offset = parent.offset();
+            let siblings = parent.green_ref().children().raw.enumerate();
+            let index = data.index() as usize;
 
-        siblings
-            .skip(index + 1)
-            .map(|(index, green)| {
-                data.index.set(index as u32);
-                data.offset = parent_offset + green.rel_offset();
+            siblings
+                .skip(index + 1)
+                .map(|(index, green)| {
+                    data.index.set(index as u32);
+                    data.offset = parent_offset + green.rel_offset();
 
-                match green.as_ref() {
-                    NodeOrToken::Node(node) => {
-                        data.green = Green::Node { ptr: Cell::new(node.into()) };
-                        Some(SyntaxElement::Node(SyntaxNode {
-                            ptr: std::cell::UnsafeCell::new(ptr),
-                        }))
+                    match green.as_ref() {
+                        NodeOrToken::Node(node) => {
+                            data.green = Green::Node { ptr: Cell::new(node.into()) };
+                            Some(SyntaxElement::Node(SyntaxNode {
+                                ptr: std::cell::UnsafeCell::new(ptr),
+                            }))
+                        }
+                        NodeOrToken::Token(token) => {
+                            data.green = Green::Token { ptr: token.into() };
+                            Some(SyntaxElement::Token(SyntaxToken {
+                                ptr: std::cell::UnsafeCell::new(ptr),
+                            }))
+                        }
                     }
-                    NodeOrToken::Token(token) => {
-                        data.green = Green::Token { ptr: token.into() };
-                        Some(SyntaxElement::Token(SyntaxToken {
-                            ptr: std::cell::UnsafeCell::new(ptr),
-                        }))
-                    }
-                }
-            })
-            .next()
-            .flatten()
-            .or_else(|| {
-                data.dec_rc();
-                unsafe { free(ptr) };
-                None
-            })
+                })
+                .next()
+                .flatten()
+        };
+        // `data` and `parent` are out of scope here; their retags on `ptr`'s
+        // allocation are no longer live.
+        if result.is_none() {
+            unsafe {
+                // Decrement rc via raw pointer and free without ever
+                // materialising another `&NodeData`.
+                let _ = NodeData::dec_rc_raw(ptr);
+                free(ptr);
+            }
+        }
+        result
     }
 
     pub fn next_sibling_or_token_by_kind(
